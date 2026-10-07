@@ -11,6 +11,72 @@ components (kernel/eBPF, Kubernetes, container runtimes). The goal is to help
 you understand the limitations and make informed decisions about your
 {rte-short-name} deployment.
 
+[#_privileged-containers-can-run-code-outside-their-allow-list]
+== Privileged containers can run code outside their allow-list
+
+{rte-short-name} enforces a per-container executable allow-list against processes
+running on the container's *own* root filesystem, and it trusts the pod spec as
+input (host volumes, mount propagation, and OCI mounts are assumed intentional).
+A privileged container (for example with `CAP_SYS_ADMIN` / `CAP_SYS_CHROOT`, or
+`hostPID`) can cross filesystem and mount-namespace boundaries. {rte-short-name}
+pins exec-path resolution to the container's registered root filesystem, so the
+following boundary crossings are detected and denied in protect mode:
+
+* executing a file on a *foreign* root filesystem reached through a procfs magic
+  link (for example `/proc/1/root/<allowed-path>` or another process's
+  `.../root`, `.../exe`, `.../fd/N`), and
+* `chroot` into a sub-directory of the container's own root filesystem to make an
+  attacker-controlled file resolve to an allow-listed path.
+
+The remaining boundary crossings below are intentionally left to other layers.
+
+=== Opting a container out: `allowForeignRootExec`
+
+Foreign-root execs are denied by default. Some privileged containers legitimately
+need to run binaries from the host or another root filesystem (for example node
+agents that exec host tools via `/proc/1/root/...`). For those, set
+`allowForeignRootExec: true` on the container's rules:
+
+[source,yaml]
+----
+spec:
+  mode: protect
+  rulesByContainer:
+    my-privileged-container:
+      allowForeignRootExec: true
+      executables:
+        allowed:
+          - /entrypoint
+----
+
+* *Impact*: this is a per-container opt-out that applies only to the container it
+  is set on. When enabled, foreign-root execs for that container are permitted
+  *unconditionally* — the executable allow-list is bypassed for files that
+  resolve to a foreign root filesystem. Enable it only for trusted, privileged
+  workloads that must run host/foreign binaries.
+
+=== Why mount-based bypasses are not handled here
+
+A process with `CAP_SYS_ADMIN` can `mount --bind` (or overlay/tmpfs) an
+attacker-controlled file over an allow-listed path, and `pivot_root` into a
+crafted root (which itself requires a mount). Blocking these belongs at the
+syscall layer.
+
+* *Impact*: if a privileged container can call `mount`/`move_mount`/`pivot_root`,
+  it can replace the content behind an allow-listed path. Restrict these syscalls
+  with a *seccomp* profile (or avoid granting `CAP_SYS_ADMIN`). Reimplementing
+  mount gating in eBPF would be partial and racy, so it is out of scope.
+
+=== Why interpreter and loader abuse is not handled here
+
+If you allow-list an interpreter or dynamic loader (for example `bash`, `sh`,
+`python`, or `ld.so`), it can execute arbitrary scripts or code that the
+executable allow-list cannot observe.
+
+* *Impact*: allow-listing an interpreter effectively allows anything it can run.
+  This is inherent to allow-listing interpreters: allow-list concrete application
+  binaries rather than interpreters/loaders.
+
 [#_learning-cap-100-allowed-executables-per-proposal]
 == Learning cap: 100 allowed executables per proposal
 
